@@ -57,6 +57,10 @@ class EventResponse(BaseModel):
     total_yes_bets: int
     total_no_bets: int
     yes_percentage: int
+    team1: str
+    team2: str
+    buy_yes_price: float
+    buy_no_price: float
     variations: List[dict]  # You can adjust this if variations is a more complex type
 
     class Config:
@@ -196,3 +200,13 @@ class UserProfileEdit(BaseModel):
     add_balance: Optional[float] = None
     subtract_balance: Optional[float] = None
     ban: Optional[bool] = None
+
+
+class EventDetailResponse(BaseModel):
+    question: str
+    team1: str
+    team2: str
+    bet_end_time: str
+    total_bets: int
+    resolved: bool
+    winner: str

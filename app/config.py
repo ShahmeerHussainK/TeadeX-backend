@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import logging
 from .models import Match, Event, Share
-from .helper import calculate_share_price
+from .helper import calculate_share_price, ai_place_bet
 
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +39,7 @@ def check_and_process_results():
         eligible_events = (
             db.query(Event)
             .join(Match)
-            .filter(Match.match_time <= datetime.utcnow() - timedelta(hours=3))
+            .filter(Match.match_time <= datetime.utcnow() - timedelta(hours=3), Event.resolved==False)
             .all()
         )
 
@@ -113,6 +113,32 @@ def execute_trade(share, market_price, db):
     db.delete(share)
     db.commit()
 
+def run_ai_betting():
+    """
+    Periodically checks for eligible events and places bets as the AI bot.
+    """
+    db = next(get_db())
+    try:
+        # Get current time
+        current_time = datetime.utcnow()
+
+        # Find eligible events where betting is still open
+        eligible_events = (
+            db.query(Event)
+            .join(Match)
+            .filter(Match.bet_end_time > current_time)  # Betting still open
+            .all()
+        )
+
+        # Place bets for each eligible event
+        for event in eligible_events:
+            ai_place_bet(event.id, db)
+
+    except Exception as e:
+        logging.error(f"Error in AI betting: {str(e)}")
+    finally:
+        db.close()
+
 
 
 def start_scheduler():
@@ -132,6 +158,14 @@ def start_scheduler():
     )
 
     scheduler.add_job(lambda: execute_stop_orders(), "interval", minutes=10)
+
+    scheduler.add_job(
+    run_ai_betting,  # The function to execute
+    "interval", 
+    minutes=10, 
+    id="ai_betting_scheduler", 
+    replace_existing=True
+    )
 
 
     scheduler.start()

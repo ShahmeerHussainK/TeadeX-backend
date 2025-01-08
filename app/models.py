@@ -47,7 +47,8 @@ class Event(Base):
     total_yes_bets = Column(Integer, default=0)  # Initialize to 0
     total_no_bets = Column(Integer, default=0)  # Initialize to 0
     variations = Column(MutableList.as_mutable(JSON), default=[])
-
+    resolved = Column(Boolean, default=False)
+    winner = Column(String, default= "Pending")
     shares = relationship(
         "Share", back_populates="event", cascade="all, delete-orphan"
     )  # Updated to Share

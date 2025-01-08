@@ -12,13 +12,18 @@ import time as t
 from typing import List
 import pytz
 from .models import Match, Event, Share, User
+from .schemas import BuyShareRequest
 import os
 import requests
 from sqlalchemy import func
+from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
-from datetime import timedelta
 from fastapi import HTTPException
+import joblib
+import pandas as pd
+from random import randint
+import logging
 
 
 def scrape_and_store_matches(db: Session):
@@ -300,6 +305,8 @@ def get_match_score(team1, team2):
     Fetch match score using Google Custom Search and scrape the result page.
     Returns 1 if team1 wins, -1 if team2 wins, and 0 for a tie.
     """
+
+    load_dotenv(dotenv_path='app\.env')
     # Load API key and CSE ID from environment variables
     api_key = os.getenv("GOOGLE_API_KEY")  # Set this in your environment
     cse_id = os.getenv("CSE_ID")  # Set this in your environment
@@ -395,8 +402,11 @@ def calculate_results_for_event(event_id: int, db: Session):
     if not match:
         raise ValueError(f"Match associated with event ID {event_id} not found.")
 
+
+    current_time = datetime.utcnow()
+
     # Check if the match start time is at least 3 hours before
-    if func.now() < match.match_time + timedelta(hours=3):
+    if current_time < match.match_time + timedelta(hours=3):
         raise ValueError("Results cannot be calculated as the match has not ended.")
 
     # Determine the winner
@@ -408,6 +418,7 @@ def calculate_results_for_event(event_id: int, db: Session):
     winning_outcome = (
         "yes" if match_result == 1 else "no" if match_result == -1 else "draw"
     )
+    winner = match.team1 if match_result == 1 else match.team2 if match_result == -1 else "draw"
 
     # Fetch all shares for the event
     shares = db.query(Share).filter(Share.event_id == event_id).all()
@@ -442,8 +453,284 @@ def calculate_results_for_event(event_id: int, db: Session):
         # Remove resolved shares
         db.delete(share)
 
+    event.resolved = True
+    event.winner = winner
+    db.add(event)
+
     # Commit changes
     db.commit()
     return {"message": "Results calculated successfully for the event."}
 
 
+def buy_share(request: BuyShareRequest, db):
+    user = db.query(User).filter(User.id == request.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if request.bet_type not in ["buy", "sell"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid bet type. Must be 'buy' or 'sell'."
+        )
+    if request.outcome not in ["yes", "no"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid outcome. Must be 'yes' or 'no'."
+        )
+
+    event = db.query(Event).filter(Event.id == request.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    existing_shares = (
+        db.query(Share)
+        .filter(Share.user_id == user.id, Share.event_id == request.event_id)
+        .all()
+    )
+
+    for share in existing_shares:
+        if share.outcome != request.outcome:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Conflicting outcome detected. Existing position is {share.outcome}.",
+            )
+
+    opposing_shares = [
+        share
+        for share in existing_shares
+        if share.bet_type != request.bet_type and share.amount > 0
+    ]
+    remaining_shares = request.shareCount
+    total_profit_or_loss = 0
+
+    for share in opposing_shares:
+        trade_price = request.share_price
+        if share.amount >= remaining_shares:
+            trade_amount = remaining_shares
+            total_profit_or_loss += trade_amount * (
+                request.share_price / 100 - share.share_price / 100
+            )
+            share.amount -= remaining_shares
+            remaining_shares = 0
+            db.add(share)
+            break
+        else:
+            trade_amount = share.amount
+            total_profit_or_loss += trade_amount * (
+                request.share_price / 100 - share.share_price / 100
+            )
+            remaining_shares -= trade_amount
+            db.delete(share)
+
+    user.sweeps_points += total_profit_or_loss
+
+    if remaining_shares > 0:
+        total_cost = (request.share_price / 100) * remaining_shares
+        if user.sweeps_points < total_cost:
+            raise HTTPException(
+                status_code=400, detail="Insufficient balance for the trade."
+            )
+        user.sweeps_points -= total_cost
+
+        new_share = Share(
+            user_id=user.id,
+            event_id=request.event_id,
+            amount=remaining_shares,
+            bet_type=request.bet_type,
+            outcome=request.outcome,
+            share_price=request.share_price,
+            limit_price=request.limit_price,
+        )
+        db.add(new_share)
+
+    if request.outcome == "yes":
+        if request.bet_type == "buy":
+            event.total_yes_bets += request.shareCount
+        else:
+            event.total_yes_bets -= request.shareCount
+    elif request.outcome == "no":
+        if request.bet_type == "buy":
+            event.total_no_bets += request.shareCount
+        else:
+            event.total_no_bets -= request.shareCount
+
+    db.commit()
+    return {
+        "message": "Trade executed successfully",
+        "profit_or_loss": round(total_profit_or_loss, 2),
+    }
+
+
+def get_share_price(eventId: int, type: str, db):
+    # Validate the type parameter
+    if type not in ["buy", "sell"]:
+        raise HTTPException(
+            status_code=400, detail="Invalid type. Must be 'buy' or 'sell'."
+        )
+
+    # Retrieve the match details for the given event ID
+    match = db.query(Event).filter(Event.id == eventId).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Event not found.")
+
+    # Calculate the total shares bought for both outcomes
+    total_shares = match.total_yes_bets + match.total_no_bets
+
+    # Set a fixed spread value
+    spread_value = 2  # Fixed spread value
+
+    # Avoid division by zero if there are no shares bought yet
+    if total_shares == 0:
+        yes_price = 50  # Set a base price of 50 when no shares have been bought
+        no_price = 50
+    else:
+        # Calculate share price as a percentage of total shares bought for each outcome
+        yes_price = (match.total_yes_bets / total_shares) * 100
+        no_price = (match.total_no_bets / total_shares) * 100
+
+    # Adjust prices based on the type (buy or sell)
+    if type == "buy":
+        yes_price += spread_value
+        no_price += spread_value
+    elif type == "sell":
+        yes_price -= spread_value
+        no_price -= spread_value
+
+    # Ensure prices don't go below 0
+    yes_price = max(0, yes_price)
+    no_price = max(0, no_price)
+
+    return {
+        "eventId": eventId,
+        "type": type,
+        "yes_price": round(yes_price, 2),
+        "no_price": round(no_price, 2),
+    }
+
+
+model = joblib.load("app/team_matchup_predictor.pkl")
+scaler = joblib.load("app/scaler.pkl")
+stats_df = pd.read_excel('app/team_stats_data.xlsx')
+
+def get_team_stats(team_name: str):
+    """
+    Extract stats for a specific team based on required features.
+    """
+
+    features = [
+    "ADJ OE", "ADJ DE", "EFG", "EFG D", "FT RATE", "FT RATE D", 
+    "TOV%", "TOV% D", "O REB%", "OP OREB%", "2P %", "2P % D.", "3P %", "3P % D."
+    ]
+    try:
+        # Filter the dataset for the specific team
+        team_stats = stats_df.loc[stats_df['TEAM'] == team_name, features]
+        
+        if team_stats.empty:
+            raise ValueError(f"Team {team_name} not found in the dataset.")
+        
+        # Return the team stats as a dictionary
+        return team_stats.iloc[0].values  # Convert the row to a dictionary
+    except Exception as e:
+        raise ValueError(f"Error fetching stats for {team_name}: {str(e)}")
+
+
+def predict_team_win_probability(team1, team2):
+    """
+    Predict the win probabilities for two teams.
+    """
+
+    team1_stats= get_team_stats(team1)
+    team2_stats= get_team_stats(team2)
+
+    # Scale the stats
+    team1_scaled = scaler.transform([team1_stats])
+    team2_scaled = scaler.transform([team2_stats])
+
+    # Predict win rates
+    team1_win_rate = model.predict(team1_scaled)[0]
+    team2_win_rate = model.predict(team2_scaled)[0]
+
+    # Normalize probabilities
+    total = team1_win_rate + team2_win_rate
+    team1_prob = team1_win_rate / total
+    team2_prob = team2_win_rate / total
+
+    return team1_prob, team2_prob
+
+
+def predict(team1: str, team2: str):
+    try:
+        # Check if teams exist in the dataset
+        if team1 not in stats_df['TEAM'].values or team2 not in stats_df['TEAM'].values:
+            raise ValueError("One or both teams not found in the dataset.")
+        
+        # Predict the match-up
+        team1_prob,team2_prob = predict_team_win_probability(team1, team2)
+        return team1_prob,team2_prob
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def ai_place_bet(event_id: int, db):
+    """
+    AI Bot places bets for a given event intelligently.
+    - Predicts probabilities for the two teams using the trained model.
+    - Bets on the outcome with a higher probability.
+    - Saves the bet in the database under the AI user.
+    """
+    try:
+        # AI user ID
+        bot_user_id = "ts0Q2DAo9UVORtL2yKu6b3LPIcH3"
+
+        # Fetch the event and match details
+        event = db.query(Event).filter(Event.id == event_id).first()
+        if not event:
+            raise ValueError(f"Event with ID {event_id} not found.")
+
+        match = db.query(Match).filter(Match.id == event.match_id).first()
+        if not match:
+            raise ValueError(f"Match associated with event ID {event_id} not found.")
+
+        # Predict probabilities for the two teams
+        team1 = match.team1
+        team2 = match.team2
+        prob_team1, prob_team2 = predict(team1, team2)
+
+        # Log probabilities for debugging
+        logging.info(f"Probabilities for event {event_id}: {team1} ({prob_team1}), {team2} ({prob_team2})")
+
+        # Determine the outcome to bet on
+        if prob_team1 > prob_team2:
+            outcome = "no"  # Assume "yes" corresponds to Team1
+            probability_diff = prob_team1 - prob_team2
+        else:
+            outcome = "yes"  # Assume "no" corresponds to Team2
+            probability_diff = prob_team2 - prob_team1
+
+        # Adjust bet size based on probability difference
+        base_bet = randint(1, 10)  # Base number of shares to bet
+        if probability_diff > 0.8:  # Large difference
+            bet_size = base_bet * 0.5  # Smaller bet to avoid bias
+        elif probability_diff > 0.6:  # Moderate difference
+            bet_size = base_bet * 0.75
+        else:
+            bet_size = base_bet  # Normal bet for close probabilities
+
+        # Get the current share price for the outcome
+        share_price_response = get_share_price(eventId=event_id, type="buy", db=db)
+        share_price = share_price_response["yes_price"] if outcome == "yes" else share_price_response["no_price"]
+
+        # Prepare the buy request payload
+        buy_request = BuyShareRequest(
+            user_id=bot_user_id,
+            event_id=event_id,
+            outcome=outcome,
+            bet_type="buy",
+            shareCount=int(bet_size),
+            share_price=share_price
+        )
+
+        # Call the buy API to place the bet
+        buy_response = buy_share(buy_request, db)
+        logging.info(f"AI bot placed bet: {buy_response}")
+
+    except Exception as e:
+        logging.error(f"Error in AI bot betting for event {event_id}: {str(e)}")
